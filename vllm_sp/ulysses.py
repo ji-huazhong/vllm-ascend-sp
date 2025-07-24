@@ -24,6 +24,14 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
 from .utils import PatchHelper
 
 
+def apply_ulysses_patches():
+    UlyssesModelConfigPatch.apply_patch()
+    UlyssesParallelStatePatch.apply_patch()
+    UlyssesMultiprocExecutorPatch.apply_patch()
+    UlyssesAttentionPatch.apply_patch()
+    UlyssesFlashAttentionImplPatch.apply_patch()
+
+
 class UlyssesModelConfigPatch(PatchHelper[ModelConfig]):
     def get_num_kv_heads(
         self: ModelConfig,
@@ -189,7 +197,7 @@ class UlyssesParallelStatePatch(PatchHelper[parallel_state]):
         parallel_state._DP = _DP
 
 
-class UlyssesMultiprocPatch(PatchHelper[MultiprocExecutor]):
+class UlyssesMultiprocExecutorPatch(PatchHelper[MultiprocExecutor]):
     def _init_executor(self) -> None:
         # Call self shutdown at exit to clean up
         # and ensure workers will be terminated.
