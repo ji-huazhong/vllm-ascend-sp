@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 import numpy as np
-from vllm.distributed.parallel_state import get_pp_group
+
 from vllm.forward_context import set_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
@@ -74,19 +74,31 @@ class NPUModelRunnerPatch(PatchHelper[NPUModelRunner]):
     ) -> tuple[Union[AscendMetadata, AscendMLAMetadata,
                      AscendTorchairMetadata], torch.Tensor, SpecDecodeMetadata,
                torch.Tensor, int, torch.Tensor, torch.Tensor, np.ndarray]:
+        assert self.torchair_graph_enabled is not True
+
         # Check input valid
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
-        if (self.use_aclgraph and total_num_scheduled_tokens
-                <= self.aclgraph_batch_sizes[-1]):
+
+        # add padding to the batch size to make it a multiple of SP
+        SP = self.parallel_config.ulysses_sequence_parallel_size
+        num_input_tokens = (total_num_scheduled_tokens + SP - 1) // SP * SP
+        if (self.use_aclgraph
+                and num_input_tokens // SP <= self.aclgraph_batch_sizes[-1]):
             # Add padding to the batch size.
             num_input_tokens = self.vllm_config.pad_for_cudagraph(
-                total_num_scheduled_tokens)
+                num_input_tokens // SP)
         else:
             # Eager mode.
-            num_input_tokens = total_num_scheduled_tokens
+            num_input_tokens = num_input_tokens
+        if (self.use_aclgrpoh and total_num_scheduled_tokens
+                <= self.aclgraph_batch_sizes[-1]):
+            orig_num_input_tokens = self.vllm_config.pad_for_cudagraph(
+                total_num_scheduled_tokens)
+        else:
+            orig_num_input_tokens = total_num_scheduled_tokens
 
         modified_batch = self.attn_metadata_builder.reorder_batch(
             self.input_batch, scheduler_output)
@@ -137,14 +149,11 @@ class NPUModelRunnerPatch(PatchHelper[NPUModelRunner]):
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
             self._calc_mrope_positions(scheduler_output)
-
-        if self.uses_mrope:
-            # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
             self.mrope_positions[:, :total_num_scheduled_tokens].copy_(
                 self.mrope_positions_cpu[:, :total_num_scheduled_tokens],
                 non_blocking=True)
 
-        self.positions[total_num_scheduled_tokens:num_input_tokens].zero_()
+        self.positions[total_num_scheduled_tokens:orig_num_input_tokens].zero_()
         self.positions[:total_num_scheduled_tokens].copy_(
             self.positions_cpu[:total_num_scheduled_tokens], non_blocking=True)
         positions = self.positions[:num_input_tokens]
@@ -216,16 +225,16 @@ class NPUModelRunnerPatch(PatchHelper[NPUModelRunner]):
             extra_builder_kwargs['with_prefill_across_dp'] = with_prefill
 
         # Add graph_pad_size here
-        if self.torchair_graph_enabled and not with_prefill:
-            if self.dp_size > 1:
-                padded_batch_size = self.select_torchair_padded_batch_size(
-                    max_num_tokens)
-            else:
-                padded_batch_size = self.select_torchair_padded_batch_size(
-                    total_num_scheduled_tokens)
-            graph_pad_size = padded_batch_size - total_num_scheduled_tokens
+        # if self.torchair_graph_enabled and not with_prefill:
+        #     if self.dp_size > 1:
+        #         padded_batch_size = self.select_torchair_padded_batch_size(
+        #             max_num_tokens)
+        #     else:
+        #         padded_batch_size = self.select_torchair_padded_batch_size(
+        #             total_num_scheduled_tokens)
+        #     graph_pad_size = padded_batch_size - total_num_scheduled_tokens
 
-            extra_builder_kwargs['graph_pad_size'] = graph_pad_size
+        #     extra_builder_kwargs['graph_pad_size'] = graph_pad_size
 
         if self.vllm_config.model_config.use_mla:
             extra_builder_kwargs[
@@ -235,8 +244,7 @@ class NPUModelRunnerPatch(PatchHelper[NPUModelRunner]):
                 num_actual_tokens=total_num_scheduled_tokens,
                 max_query_len=max_num_scheduled_tokens,
                 **extra_builder_kwargs,
-            )
-            attn_metadata.num_input_tokens = num_input_tokens
+            )    
         else:
             attn_metadata = self.attn_metadata_builder.build(  # type: ignore
                 num_reqs=num_reqs,
@@ -244,6 +252,8 @@ class NPUModelRunnerPatch(PatchHelper[NPUModelRunner]):
                 max_query_len=max_num_scheduled_tokens,
                 **extra_builder_kwargs,
             )
+        
+        attn_metadata.num_input_tokens = num_input_tokens
 
         # Prepare input_ids
         token_indices = (positions_np +
@@ -264,6 +274,8 @@ class NPUModelRunnerPatch(PatchHelper[NPUModelRunner]):
             mm_embeds = self._gather_mm_embeddings(scheduler_output)
         else:
             mm_embeds = []
+
+        # 在这个位置插入变化！
 
         if self.is_multimodal_model:
             # NOTE(woosuk): To unify token ids and soft tokens (vision
@@ -290,10 +302,11 @@ class NPUModelRunnerPatch(PatchHelper[NPUModelRunner]):
         if self.uses_mrope:
             positions = self.mrope_positions[:, :num_input_tokens]
 
-        if self.torchair_graph_enabled and not with_prefill:
-            input_ids = self.input_ids[:padded_batch_size]
-            positions = self.positions[:padded_batch_size]
+        # if self.torchair_graph_enabled and not with_prefill:
+        #     input_ids = self.input_ids[:padded_batch_size]
+        #     positions = self.positions[:padded_batch_size]
 
+        from vllm.distributed.parallel_state import get_pp_group
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
         else:
@@ -312,24 +325,24 @@ class NPUModelRunnerPatch(PatchHelper[NPUModelRunner]):
                                  self.vllm_config,
                                  num_tokens=num_input_tokens):
             with ProfileExecuteDuration().capture_async("forward"):
-                model_kwargs = {}
-                if self.torchair_graph_enabled:
-                    model_kwargs["kv_caches"] = self.kv_caches
-                    model_kwargs["attn_metadata"] = attn_metadata
-                if self.torchair_graph_enabled and not with_prefill:
-                    maybe_converting_weight_acl_format(self.model,
-                                                       ACL_FORMAT_FRACTAL_NZ)
+                # model_kwargs = {}
+                # if self.torchair_graph_enabled:
+                #     model_kwargs["kv_caches"] = self.kv_caches
+                #     model_kwargs["attn_metadata"] = attn_metadata
+                # if self.torchair_graph_enabled and not with_prefill:
+                #     maybe_converting_weight_acl_format(self.model,
+                #                                        ACL_FORMAT_FRACTAL_NZ)
 
-                    compiled_model = self._get_torchair_lazy_compiled_model(
-                        padded_batch_size)
-                    hidden_states = compiled_model(
-                        input_ids=input_ids,
-                        positions=positions,
-                        intermediate_tensors=intermediate_tensors,
-                        inputs_embeds=inputs_embeds,
-                        **model_kwargs,
-                    )
-                else:
+                #     compiled_model = self._get_torchair_lazy_compiled_model(
+                #         padded_batch_size)
+                #     hidden_states = compiled_model(
+                #         input_ids=input_ids,
+                #         positions=positions,
+                #         intermediate_tensors=intermediate_tensors,
+                #         inputs_embeds=inputs_embeds,
+                #         **model_kwargs,
+                #     )
+                # else:
                     assert self.model is not None
                     maybe_converting_weight_acl_format(self.model,
                                                        ACL_FORMAT_FRACTAL_ND)
@@ -339,7 +352,7 @@ class NPUModelRunnerPatch(PatchHelper[NPUModelRunner]):
                         positions=positions,
                         intermediate_tensors=intermediate_tensors,
                         inputs_embeds=inputs_embeds,
-                        **model_kwargs,
+                        # **model_kwargs,
                     )
 
         use_spec_decode = len(
@@ -377,29 +390,7 @@ class NPUModelRunnerPatch(PatchHelper[NPUModelRunner]):
         start_time = time.perf_counter()
         start_free_npu_memory = torch.npu.mem_get_info()[0]
         SP = self.parallel_config.sequence_parallel_size
-        # TODO(NeverRaR): Calling graph_capture(device=self.device) in
-        # torchair graph capture can cause some issues, so now we just
-        # temporarily split the codepath for the two different graph patterns.
-        if self.torchair_graph_enabled:
-            torchair_graph_batch_sizes = self.torchair_graph_batch_sizes
-            graph_num = len(torchair_graph_batch_sizes)
-            logger.info(
-                "Capturing torchair graph, this usually takes %.1f~%.1f mins.",
-                0.5 * graph_num, 1.5 * graph_num)
-            # Trigger torchair graph capture for specific shapes.
-            # Capture the large shapes first so that the smaller shapes
-            # can reuse the memory pool allocated for the large shapes.
-            for idx, num_tokens in enumerate(
-                    reversed(torchair_graph_batch_sizes)):
-                for _ in range(self.vllm_config.compilation_config.
-                               cudagraph_num_of_warmups):
-                    # NOTE: when in torchair graph and not with_prefill,
-                    # we don't need to set `skip_attn=False`
-                    self._dummy_run(num_tokens * SP, is_torchair_compile=True)
-                self._dummy_run(num_tokens * SP, is_torchair_compile=True)
-                logger.info("Batchsize %d is compiled successfully: %d/%d.",
-                            num_tokens, idx + 1, graph_num)
-        elif self.use_aclgraph:
+        if self.use_aclgraph:
             # Trigger ACL graph capture for specific shapes.
             # Capture the large shapes first so that the smaller shapes
             # can reuse the memory pool allocated for the large shapes.
