@@ -1,28 +1,20 @@
 import time
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import numpy as np
 
-from vllm.forward_context import set_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.attention.attention_v1 import (
-    AscendAttentionState,
-    AscendMetadata,
-)
-from vllm_ascend.attention.mla_v1 import AscendMLAMetadata
-from vllm_ascend.attention.attention_v1_torchair import AscendTorchairMetadata
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+from vllm_ascend.attention.utils import \
+    AscendCommonAttentionMetadata as CommonAttentionMetadata
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-from vllm_ascend.utils import (
-    ACL_FORMAT_FRACTAL_ND,
-    ACL_FORMAT_FRACTAL_NZ,
-    ProfileExecuteDuration,
-    vllm_version_is,
-    maybe_converting_weight_acl_format,
-)
+from vllm_ascend.utils import ProfileExecuteDuration
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -67,38 +59,27 @@ class NPUModelRunnerPatch(PatchHelper[NPUModelRunner]):
         if self.parallel_config.ulysses_sequence_parallel_size > 1:
             self.patch_forward()
 
+    # remove support for torchair graph
     def _process_reqs(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
-    ) -> tuple[Union[AscendMetadata, AscendMLAMetadata,
-                     AscendTorchairMetadata], torch.Tensor, SpecDecodeMetadata,
-               torch.Tensor, int, torch.Tensor, torch.Tensor, np.ndarray]:
-        assert self.torchair_graph_enabled is not True
-
+    ) -> tuple[SpecDecodeMetadata, torch.Tensor, SpecDecodeMetadata,
+               torch.Tensor, int, torch.Tensor, Optional[set[str]],
+               Optional[set[str]]]:
         # Check input valid
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
-
-        # add padding to the batch size to make it a multiple of SP
-        SP = self.parallel_config.ulysses_sequence_parallel_size
-        num_input_tokens = (total_num_scheduled_tokens + SP - 1) // SP * SP
-        if (self.use_aclgraph
-                and num_input_tokens // SP <= self.aclgraph_batch_sizes[-1]):
+        if (self.use_aclgraph and
+                total_num_scheduled_tokens <= self.aclgraph_batch_sizes[-1]):
             # Add padding to the batch size.
             num_input_tokens = self.vllm_config.pad_for_cudagraph(
-                num_input_tokens // SP)
-        else:
-            # Eager mode.
-            num_input_tokens = num_input_tokens
-        if (self.use_aclgrpoh and total_num_scheduled_tokens
-                <= self.aclgraph_batch_sizes[-1]):
-            orig_num_input_tokens = self.vllm_config.pad_for_cudagraph(
                 total_num_scheduled_tokens)
         else:
-            orig_num_input_tokens = total_num_scheduled_tokens
+            # Eager mode.
+            num_input_tokens = total_num_scheduled_tokens
 
         modified_batch = self.attn_metadata_builder.reorder_batch(
             self.input_batch, scheduler_output)
@@ -107,10 +88,7 @@ class NPUModelRunnerPatch(PatchHelper[NPUModelRunner]):
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
-        if vllm_version_is("0.9.2"):
-            self.input_batch.block_table.commit(num_reqs)
-        else:
-            self.input_batch.block_table.commit_block_table(num_reqs)
+        self.input_batch.block_table.commit(num_reqs)
 
         # Get the number of scheduled tokens for each request.
         # TODO: The Python loop can be slow. Optimize.
@@ -135,8 +113,8 @@ class NPUModelRunnerPatch(PatchHelper[NPUModelRunner]):
         cu_num_tokens = np.cumsum(num_scheduled_tokens)
         cumsums_offsets = np.repeat(cu_num_tokens - num_scheduled_tokens,
                                     num_scheduled_tokens)
-        logits_indices = cu_num_tokens - 1
-        logits_indices = torch.from_numpy(logits_indices).to(self.device,
+        sample_indices = cu_num_tokens - 1
+        sample_indices = torch.from_numpy(sample_indices).to(self.device,
                                                              non_blocking=True)
         arange = self.arange_np[:total_num_scheduled_tokens] - cumsums_offsets
 
@@ -149,11 +127,14 @@ class NPUModelRunnerPatch(PatchHelper[NPUModelRunner]):
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
             self._calc_mrope_positions(scheduler_output)
+
+        if self.uses_mrope:
+            # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
             self.mrope_positions[:, :total_num_scheduled_tokens].copy_(
                 self.mrope_positions_cpu[:, :total_num_scheduled_tokens],
                 non_blocking=True)
 
-        self.positions[total_num_scheduled_tokens:orig_num_input_tokens].zero_()
+        self.positions[total_num_scheduled_tokens:num_input_tokens].zero_()
         self.positions[:total_num_scheduled_tokens].copy_(
             self.positions_cpu[:total_num_scheduled_tokens], non_blocking=True)
         positions = self.positions[:num_input_tokens]
@@ -182,23 +163,26 @@ class NPUModelRunnerPatch(PatchHelper[NPUModelRunner]):
         # We assume it is the decode stage, where prefill occurs but only one token is not hit in cache.
         elif np.all(num_scheduled_tokens == 1):
             attn_state = AscendAttentionState.DecodeOnly
+            if self.speculative_config and self.speculative_config.method == 'deepseek_mtp':
+                # SpecDecoding now supports seq_len=1 and seq_len=2
+                attn_state = AscendAttentionState.SpecDecoding
         # Speculative decoding.
         elif np.all(num_valid_tokens == 1):
-            if self.use_eagle:
-                attn_state = AscendAttentionState.ChunkedPrefill
-            else:
-                attn_state = AscendAttentionState.SpecDecoding
+            attn_state = AscendAttentionState.SpecDecoding
         # splitfuse
         elif not ascend_config.ascend_scheduler_config.enabled or self.chunked_prefill_enabled:
             attn_state = AscendAttentionState.ChunkedPrefill
         else:
             attn_state = AscendAttentionState.PrefillCacheHit
 
-        self.attn_mask = self._make_attention_mask(
-            seq_lens=seq_lens,
-            query_lens=num_scheduled_tokens,
-            position=positions,
-            attn_state=attn_state)
+        # NOTE: when use ring_mla, attn_mask don't need to generate here.
+        if not self.use_ring_mla or attn_state == AscendAttentionState.PrefillNoCache:
+            attn_mask = self._make_attention_mask(
+                seq_lens=seq_lens,
+                query_lens=num_scheduled_tokens,
+                position=positions,
+                attn_state=attn_state)
+            self.attn_mask = attn_mask
         self.attn_state = attn_state  # type: ignore
 
         extra_builder_kwargs = {}
@@ -209,50 +193,59 @@ class NPUModelRunnerPatch(PatchHelper[NPUModelRunner]):
             self.query_start_loc_cpu[:num_reqs + 1], non_blocking=True)
         self.seq_lens[:num_reqs].copy_(self.seq_lens_cpu[:num_reqs],
                                        non_blocking=True)
+        self.slot_mapping[:total_num_scheduled_tokens].copy_(
+            self.slot_mapping_cpu[:total_num_scheduled_tokens],
+            non_blocking=True)
 
         # Fill unused with -1. Needed for reshape_and_cache
+        self.slot_mapping[total_num_scheduled_tokens:].fill_(-1)
         self.seq_lens[num_reqs:].fill_(0)
         self.query_start_loc[num_reqs + 1:].fill_(-1)
 
+        query_start_loc = self.query_start_loc[:num_reqs + 1]
+        # Use host tensor, other wise error: tensor.hostData is null
+        common_attn_metadata = CommonAttentionMetadata(
+            query_start_loc=query_start_loc,
+            seq_lens=self.seq_lens_cpu[:num_reqs])
+        self.common_attn_metadata = common_attn_metadata
+        self.seq_lens_list = self.seq_lens_np.tolist()[:num_input_tokens]
         with_prefill = attn_state not in [
             AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding
         ]
+        enable_dbo = self._check_dbo_is_valid(self.query_lens.tolist(),
+                                              attn_state,
+                                              total_num_scheduled_tokens)
 
-        if self.dp_size > 1:
-            max_num_tokens, with_prefill = self._get_forward_metadata_across_dp(
-                total_num_scheduled_tokens, with_prefill)
-            extra_builder_kwargs['max_num_tokens_across_dp'] = max_num_tokens
-            extra_builder_kwargs['with_prefill_across_dp'] = with_prefill
+        maybe_padded_num_tokens = total_num_scheduled_tokens
+        (padded_num_tokens_across_dp, num_tokens_across_dp, with_prefill,
+         enable_dbo) = self._get_forward_metadata_across_dp(
+             maybe_padded_num_tokens, total_num_scheduled_tokens, with_prefill,
+             enable_dbo)
+        extra_builder_kwargs['enable_dbo_across_dp'] = enable_dbo
 
-        # Add graph_pad_size here
-        # if self.torchair_graph_enabled and not with_prefill:
-        #     if self.dp_size > 1:
-        #         padded_batch_size = self.select_torchair_padded_batch_size(
-        #             max_num_tokens)
-        #     else:
-        #         padded_batch_size = self.select_torchair_padded_batch_size(
-        #             total_num_scheduled_tokens)
-        #     graph_pad_size = padded_batch_size - total_num_scheduled_tokens
-
-        #     extra_builder_kwargs['graph_pad_size'] = graph_pad_size
+        # TODO(zzzzwwjj): this code need to refactor afterwards.
+        self.with_prefill = with_prefill
+        self.extra_builder_kwargs = extra_builder_kwargs
+        self.num_tokens_across_dp = num_tokens_across_dp
 
         if self.vllm_config.model_config.use_mla:
-            extra_builder_kwargs[
-                "query_start_loc"] = self.query_start_loc[:num_reqs + 1]
             attn_metadata = self.attn_metadata_builder.build(  # type: ignore
                 num_reqs=num_reqs,
                 num_actual_tokens=total_num_scheduled_tokens,
                 max_query_len=max_num_scheduled_tokens,
+                common_attn_metadata=common_attn_metadata,
+                common_prefix_len=None,
                 **extra_builder_kwargs,
-            )    
+            )
         else:
             attn_metadata = self.attn_metadata_builder.build(  # type: ignore
                 num_reqs=num_reqs,
                 num_actual_tokens=total_num_scheduled_tokens,
                 max_query_len=max_num_scheduled_tokens,
+                common_attn_metadata=common_attn_metadata,
+                common_prefix_len=None,
                 **extra_builder_kwargs,
             )
-        
         attn_metadata.num_input_tokens = num_input_tokens
 
         # Prepare input_ids
@@ -275,7 +268,19 @@ class NPUModelRunnerPatch(PatchHelper[NPUModelRunner]):
         else:
             mm_embeds = []
 
-        # 在这个位置插入变化！
+        # add padding to the batch size to make it a multiple of SP
+        SP = self.parallel_config.ulysses_sequence_parallel_size
+        num_input_tokens = (total_num_scheduled_tokens + SP - 1) // SP * SP
+        if (self.use_aclgraph and
+                num_input_tokens // SP <= self.aclgraph_batch_sizes[-1]):
+            # Use piecewise NPU graphs.
+            # Add padding to the batch size.
+            num_input_tokens = SP * self.vllm_config.pad_for_cudagraph(
+                num_input_tokens // SP)
+        else:
+            # Eager mode.
+            pass
+        attn_metadata.num_input_tokens = num_input_tokens
 
         if self.is_multimodal_model:
             # NOTE(woosuk): To unify token ids and soft tokens (vision
@@ -296,65 +301,40 @@ class NPUModelRunnerPatch(PatchHelper[NPUModelRunner]):
             # For text-only models, we use token ids as input.
             # While it is possible to use embeddings as input just like the
             # multimodal models, it is not desirable for performance since
-            # then the embedding layer is not included in the ACL graph.
+            # then the embedding layer is not included in the ACL Graph.
             input_ids = self.input_ids[:num_input_tokens]
             inputs_embeds = None
         if self.uses_mrope:
             positions = self.mrope_positions[:, :num_input_tokens]
-
-        # if self.torchair_graph_enabled and not with_prefill:
-        #     input_ids = self.input_ids[:padded_batch_size]
-        #     positions = self.positions[:padded_batch_size]
-
-        from vllm.distributed.parallel_state import get_pp_group
-        if get_pp_group().is_first_rank:
-            intermediate_tensors = None
         else:
-            assert intermediate_tensors is not None
-            assert self.intermediate_tensors is not None
-            for k, v in intermediate_tensors.items():
-                self.intermediate_tensors[k][:num_input_tokens].copy_(
-                    v[:num_input_tokens], non_blocking=True)
-            intermediate_tensors = IntermediateTensors({
-                k: v[:num_input_tokens]
-                for k, v in self.intermediate_tensors.items()
-            })
+            positions = self.positions[:num_input_tokens]
 
         # Run forward pass
-        with set_forward_context(attn_metadata,
-                                 self.vllm_config,
-                                 num_tokens=num_input_tokens):
+        # TODO(zzzzwwjj): check param `num_tokens_across_dp` later.
+        with set_ascend_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=padded_num_tokens_across_dp,
+                num_tokens_across_dp=num_tokens_across_dp,
+                with_prefill=with_prefill,
+                num_actual_tokens=total_num_scheduled_tokens):
             with ProfileExecuteDuration().capture_async("forward"):
-                # model_kwargs = {}
-                # if self.torchair_graph_enabled:
-                #     model_kwargs["kv_caches"] = self.kv_caches
-                #     model_kwargs["attn_metadata"] = attn_metadata
-                # if self.torchair_graph_enabled and not with_prefill:
-                #     maybe_converting_weight_acl_format(self.model,
-                #                                        ACL_FORMAT_FRACTAL_NZ)
+                self.maybe_setup_kv_connector(scheduler_output)
+                model_kwargs = {}
+                if envs_ascend.VLLM_ASCEND_ENABLE_DBO and with_prefill:
+                    model_kwargs["graph_enable"] = False  # type: ignore
 
-                #     compiled_model = self._get_torchair_lazy_compiled_model(
-                #         padded_batch_size)
-                #     hidden_states = compiled_model(
-                #         input_ids=input_ids,
-                #         positions=positions,
-                #         intermediate_tensors=intermediate_tensors,
-                #         inputs_embeds=inputs_embeds,
-                #         **model_kwargs,
-                #     )
-                # else:
-                    assert self.model is not None
-                    maybe_converting_weight_acl_format(self.model,
-                                                       ACL_FORMAT_FRACTAL_ND)
+                assert self.model is not None
+                hidden_states = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs)
 
-                    hidden_states = self.model(
-                        input_ids=input_ids,
-                        positions=positions,
-                        intermediate_tensors=intermediate_tensors,
-                        inputs_embeds=inputs_embeds,
-                        # **model_kwargs,
-                    )
-
+        self.maybe_wait_for_kv_save()
+        finished_sending, finished_recving = self.get_finished_kv_transfer(
+            scheduler_output)
         use_spec_decode = len(
             scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
@@ -376,15 +356,12 @@ class NPUModelRunnerPatch(PatchHelper[NPUModelRunner]):
 
             spec_decode_metadata = self._calc_spec_decode_metadata(
                 num_draft_tokens, cu_num_tokens)
-            logits_indices = spec_decode_metadata.logits_indices
-
-        aux_hidden_states = None
-        if self.use_aux_hidden_state_outputs:
-            hidden_states, aux_hidden_states = hidden_states
+            sample_indices = spec_decode_metadata.logits_indices
 
         return (attn_metadata, hidden_states, spec_decode_metadata, positions,
-                total_num_scheduled_tokens, logits_indices, aux_hidden_states,
-                num_scheduled_tokens)
+                total_num_scheduled_tokens, sample_indices, finished_sending,
+                finished_recving)
+
 
     def capture_model(self) -> None:
         start_time = time.perf_counter()
